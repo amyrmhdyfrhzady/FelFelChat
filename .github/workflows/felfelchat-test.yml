@@ -1,5 +1,5 @@
 
-name: FelFelChat Runner Test
+name: FelFelChat Runner
 
 on:
   workflow_dispatch:
@@ -8,16 +8,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: felfelchat-runner-test
+  group: felfelchat-runner
   cancel-in-progress: false
 
 jobs:
   run-server:
+    name: Build, Tunnel and Keep Alive
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
+    env:
+      GATEWAY_URL: https://amirgram.agkirusu4su5s.workers.dev
+      PORT: "3000"
+      NODE_ENV: production
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -26,20 +32,39 @@ jobs:
           node-version: "22"
           cache: npm
 
+      - name: Validate required secrets
+        shell: bash
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          BACKUP_SIGNING_KEY: ${{ secrets.BACKUP_SIGNING_KEY }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          for name in DATABASE_URL JWT_SECRET BACKUP_SIGNING_KEY ADMIN_TOKEN; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          echo "Required secrets are configured."
+
       - name: Install dependencies
         run: npm ci
 
-      - name: Configure environment
+      - name: Configure application environment
         shell: bash
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           BACKUP_SIGNING_KEY: ${{ secrets.BACKUP_SIGNING_KEY }}
         run: |
+          set -Eeuo pipefail
+
           {
-            echo "NODE_ENV=production"
-            echo "PORT=3000"
-            echo "APP_ORIGIN=https://amirgram.agkirusu4su5s.workers.dev"
+            echo "APP_ORIGIN=$GATEWAY_URL"
             echo "DATABASE_URL=$DATABASE_URL"
             echo "JWT_SECRET=$JWT_SECRET"
             echo "BACKUP_SIGNING_KEY=$BACKUP_SIGNING_KEY"
@@ -49,130 +74,265 @@ jobs:
             echo "AUDIT_LOG_DIR=./logs"
           } >> "$GITHUB_ENV"
 
+          mkdir -p uploads backups logs
+
       - name: Generate Prisma client
         run: npx prisma generate
 
-      - name: Sync database schema
+      - name: Synchronize MongoDB schema
         run: npm run db:migrate
 
       - name: Build application
         run: npm run build
 
-      - name: Start application
-        run: |
-          mkdir -p uploads backups logs
-          nohup npm start > app.log 2>&1 &
-          echo $! > app.pid
-
-      - name: Wait for application readiness
+      - name: Install Cloudflare Tunnel
         shell: bash
         run: |
-          ready=0
+          set -Eeuo pipefail
 
-          for i in $(seq 1 60); do
-            if curl --fail --silent \
-              http://127.0.0.1:3000/api/ready \
-              -o /tmp/ready.json; then
-              ready=1
-              break
-            fi
-
-            if ! kill -0 "$(cat app.pid)" 2>/dev/null; then
-              echo "Application process exited."
-              tail -n 100 app.log
-              exit 1
-            fi
-
-            sleep 5
-          done
-
-          if [ "$ready" -ne 1 ]; then
-            echo "Application readiness timed out."
-            tail -n 100 app.log
-            exit 1
-          fi
-
-          echo "Application readiness check passed."
-
-      - name: Install Cloudflare Tunnel client
-        run: |
-          curl --fail --location \
+          curl --fail --location --retry 3 \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             --output cloudflared
+
           chmod +x cloudflared
+          ./cloudflared --version
 
-      - name: Start temporary Tunnel
-        shell: bash
-        run: |
-          nohup ./cloudflared tunnel \
-            --url http://127.0.0.1:3000 \
-            --no-autoupdate \
-            > tunnel.log 2>&1 &
-
-          echo $! > tunnel.pid
-
-          for i in $(seq 1 60); do
-            TUNNEL_URL="$(grep -Eo \
-              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              tunnel.log | head -n 1 || true)"
-
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
-              echo "Temporary Tunnel URL: $TUNNEL_URL"
-              break
-            fi
-
-            if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
-              cat tunnel.log
-              exit 1
-            fi
-
-            sleep 2
-          done
-
-          if [ -z "${TUNNEL_URL:-}" ]; then
-            echo "Tunnel URL was not obtained."
-            cat tunnel.log
-            exit 1
-          fi
-
-      - name: Verify Tunnel and register origin
+      - name: Start service, register Tunnel and keep alive
         shell: bash
         env:
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
-          ready=0
+          set -Eeuo pipefail
 
-          for i in $(seq 1 30); do
-            if curl --fail --silent \
+          APP_PID=""
+          TUNNEL_PID=""
+          TUNNEL_URL=""
+          GATEWAY_URL="$GATEWAY_URL"
+          WORK_SECONDS=$((315 * 60))
+          START_TIME="$(date +%s)"
+
+          start_app() {
+            echo "Starting FelFelChat application..."
+
+            nohup npm start > app.log 2>&1 &
+            APP_PID=$!
+            echo "$APP_PID" > app.pid
+          }
+
+          wait_local_ready() {
+            for attempt in $(seq 1 60); do
+              if curl --fail --silent --show-error \
+                --max-time 5 \
+                http://127.0.0.1:3000/api/ready \
+                -o /tmp/felfelchat-ready.json; then
+                echo "Local application is ready."
+                return 0
+              fi
+
+              if ! kill -0 "$APP_PID" 2>/dev/null; then
+                echo "Application exited during startup."
+                tail -n 100 app.log || true
+                return 1
+              fi
+
+              sleep 5
+            done
+
+            echo "Application readiness timed out."
+            tail -n 100 app.log || true
+            return 1
+          }
+
+          start_tunnel() {
+            echo "Starting Cloudflare Quick Tunnel..."
+
+            TUNNEL_URL=""
+
+            nohup ./cloudflared tunnel \
+              --url http://127.0.0.1:3000 \
+              --no-autoupdate \
+              > tunnel.log 2>&1 &
+
+            TUNNEL_PID=$!
+            echo "$TUNNEL_PID" > tunnel.pid
+
+            for attempt in $(seq 1 60); do
+              TUNNEL_URL="$(
+                grep -Eo \
+                  'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+                  tunnel.log | head -n 1 || true
+              )"
+
+              if [ -n "$TUNNEL_URL" ]; then
+                echo "Tunnel URL: $TUNNEL_URL"
+                return 0
+              fi
+
+              if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+                echo "Cloudflare Tunnel exited during startup."
+                cat tunnel.log || true
+                return 1
+              fi
+
+              sleep 2
+            done
+
+            echo "Could not obtain a Quick Tunnel URL."
+            cat tunnel.log || true
+            return 1
+          }
+
+          verify_tunnel() {
+            curl --fail --silent --show-error \
+              --max-time 10 \
               "$TUNNEL_URL/api/ready" \
-              -o /tmp/tunnel-ready.json; then
-              ready=1
+              -o /tmp/felfelchat-tunnel-ready.json
+          }
+
+          register_tunnel() {
+            echo "Registering active Tunnel with Worker..."
+
+            local response
+            response="$(
+              curl --fail --silent --show-error \
+                --retry 3 --retry-delay 2 \
+                --max-time 20 \
+                --request POST \
+                --header "Authorization: Bearer $ADMIN_TOKEN" \
+                --header "Content-Type: application/json" \
+                --data "$(jq -n --arg origin "$TUNNEL_URL" '{origin: $origin}')" \
+                "$GATEWAY_URL/__gateway/origin"
+            )"
+
+            echo "$response" | jq -e '.ok == true and .active == true' \
+              >/dev/null
+
+            echo "Worker registration succeeded."
+          }
+
+          cleanup() {
+            echo "Stopping local processes..."
+            if [ -n "${TUNNEL_PID:-}" ]; then
+              kill "$TUNNEL_PID" 2>/dev/null || true
+            fi
+            if [ -n "${APP_PID:-}" ]; then
+              kill "$APP_PID" 2>/dev/null || true
+            fi
+          }
+
+          trap cleanup EXIT
+
+          start_app
+          wait_local_ready
+
+          start_tunnel
+          verify_tunnel
+          register_tunnel
+
+          echo "Public gateway: $GATEWAY_URL"
+          echo "Keep-alive monitoring started."
+
+          TUNNEL_FAILURES=0
+          APP_FAILURES=0
+
+          while true; do
+            NOW="$(date +%s)"
+            ELAPSED=$((NOW - START_TIME))
+
+            if [ "$ELAPSED" -ge "$WORK_SECONDS" ]; then
+              echo "Planned keep-alive window completed."
               break
             fi
-            sleep 2
+
+            sleep 30
+
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "Application process stopped; attempting restart."
+              start_app
+
+              if wait_local_ready; then
+                APP_FAILURES=0
+                register_tunnel
+              else
+                APP_FAILURES=$((APP_FAILURES + 1))
+                if [ "$APP_FAILURES" -ge 3 ]; then
+                  echo "::error::Application failed repeated recovery attempts."
+                  exit 1
+                fi
+              fi
+            else
+              if curl --fail --silent \
+                --max-time 8 \
+                http://127.0.0.1:3000/api/ready \
+                -o /dev/null; then
+                APP_FAILURES=0
+              else
+                APP_FAILURES=$((APP_FAILURES + 1))
+                echo "Local health check failed ($APP_FAILURES/3)."
+
+                if [ "$APP_FAILURES" -ge 3 ]; then
+                  echo "Restarting unhealthy application."
+                  kill "$APP_PID" 2>/dev/null || true
+                  sleep 2
+                  start_app
+
+                  if ! wait_local_ready; then
+                    echo "::error::Application recovery failed."
+                    exit 1
+                  fi
+
+                  APP_FAILURES=0
+                  register_tunnel
+                fi
+              fi
+            fi
+
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              TUNNEL_FAILURES=3
+            elif verify_tunnel; then
+              TUNNEL_FAILURES=0
+            else
+              TUNNEL_FAILURES=$((TUNNEL_FAILURES + 1))
+              echo "Tunnel health check failed ($TUNNEL_FAILURES/3)."
+            fi
+
+            if [ "$TUNNEL_FAILURES" -ge 3 ]; then
+              echo "Attempting Tunnel recovery..."
+
+              kill "$TUNNEL_PID" 2>/dev/null || true
+              sleep 2
+
+              if ! start_tunnel; then
+                echo "::error::Tunnel restart failed."
+                exit 1
+              fi
+
+              if ! verify_tunnel; then
+                echo "::error::New Tunnel is not ready."
+                exit 1
+              fi
+
+              register_tunnel
+              TUNNEL_FAILURES=0
+            fi
+
+            # Verify the stable public gateway independently.
+            if ! curl --fail --silent \
+              --max-time 10 \
+              "$GATEWAY_URL/api/ready" \
+              -o /dev/null; then
+              echo "Gateway probe failed; the next monitoring cycle will retry."
+            fi
+
+            echo "Health check passed. Elapsed: ${ELAPSED}s"
           done
 
-          if [ "$ready" -ne 1 ]; then
-            echo "Application is not reachable through Tunnel."
-            cat tunnel.log
-            exit 1
-          fi
-
-          curl --fail --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer $ADMIN_TOKEN" \
-            --header "Content-Type: application/json" \
-            --data "{\"origin\":\"$TUNNEL_URL\"}" \
-            https://amirgram.agkirusu4su5s.workers.dev/__gateway/origin
-
-          echo
-          echo "Runner registration completed."
-
-      - name: Show diagnostics on failure
+      - name: Diagnostics on failure
         if: failure()
+        shell: bash
         run: |
           echo "=== Application log ==="
-          tail -n 100 app.log 2>/dev/null || true
+          tail -n 120 app.log 2>/dev/null || true
+
           echo "=== Tunnel log ==="
-          tail -n 100 tunnel.log 2>/dev/null || true
+          tail -n 120 tunnel.log 2>/dev/null || true
