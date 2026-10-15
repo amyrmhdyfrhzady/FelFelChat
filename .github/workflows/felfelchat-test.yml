@@ -1,0 +1,178 @@
+
+name: FelFelChat Runner Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: felfelchat-runner-test
+  cancel-in-progress: false
+
+jobs:
+  run-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure environment
+        shell: bash
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          BACKUP_SIGNING_KEY: ${{ secrets.BACKUP_SIGNING_KEY }}
+        run: |
+          {
+            echo "NODE_ENV=production"
+            echo "PORT=3000"
+            echo "APP_ORIGIN=https://amirgram.agkirusu4su5s.workers.dev"
+            echo "DATABASE_URL=$DATABASE_URL"
+            echo "JWT_SECRET=$JWT_SECRET"
+            echo "BACKUP_SIGNING_KEY=$BACKUP_SIGNING_KEY"
+            echo "UPLOAD_DIR=./uploads"
+            echo "UPLOAD_MAX_SIZE_MB=20"
+            echo "BACKUP_DIR=./backups"
+            echo "AUDIT_LOG_DIR=./logs"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Sync database schema
+        run: npm run db:migrate
+
+      - name: Build application
+        run: npm run build
+
+      - name: Start application
+        run: |
+          mkdir -p uploads backups logs
+          nohup npm start > app.log 2>&1 &
+          echo $! > app.pid
+
+      - name: Wait for application readiness
+        shell: bash
+        run: |
+          ready=0
+
+          for i in $(seq 1 60); do
+            if curl --fail --silent \
+              http://127.0.0.1:3000/api/ready \
+              -o /tmp/ready.json; then
+              ready=1
+              break
+            fi
+
+            if ! kill -0 "$(cat app.pid)" 2>/dev/null; then
+              echo "Application process exited."
+              tail -n 100 app.log
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Application readiness timed out."
+            tail -n 100 app.log
+            exit 1
+          fi
+
+          echo "Application readiness check passed."
+
+      - name: Install Cloudflare Tunnel client
+        run: |
+          curl --fail --location \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            --output cloudflared
+          chmod +x cloudflared
+
+      - name: Start temporary Tunnel
+        shell: bash
+        run: |
+          nohup ./cloudflared tunnel \
+            --url http://127.0.0.1:3000 \
+            --no-autoupdate \
+            > tunnel.log 2>&1 &
+
+          echo $! > tunnel.pid
+
+          for i in $(seq 1 60); do
+            TUNNEL_URL="$(grep -Eo \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              tunnel.log | head -n 1 || true)"
+
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+              echo "Temporary Tunnel URL: $TUNNEL_URL"
+              break
+            fi
+
+            if ! kill -0 "$(cat tunnel.pid)" 2>/dev/null; then
+              cat tunnel.log
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "${TUNNEL_URL:-}" ]; then
+            echo "Tunnel URL was not obtained."
+            cat tunnel.log
+            exit 1
+          fi
+
+      - name: Verify Tunnel and register origin
+        shell: bash
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          ready=0
+
+          for i in $(seq 1 30); do
+            if curl --fail --silent \
+              "$TUNNEL_URL/api/ready" \
+              -o /tmp/tunnel-ready.json; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Application is not reachable through Tunnel."
+            cat tunnel.log
+            exit 1
+          fi
+
+          curl --fail --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $ADMIN_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "{\"origin\":\"$TUNNEL_URL\"}" \
+            https://amirgram.agkirusu4su5s.workers.dev/__gateway/origin
+
+          echo
+          echo "Runner registration completed."
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Application log ==="
+          tail -n 100 app.log 2>/dev/null || true
+          echo "=== Tunnel log ==="
+          tail -n 100 tunnel.log 2>/dev/null || true
