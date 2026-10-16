@@ -157,11 +157,7 @@ jobs:
             echo "$TUNNEL_PID" > tunnel.pid
 
             for attempt in $(seq 1 60); do
-              TUNNEL_URL="$(
-                grep -Eo \
-                  'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-                  tunnel.log | head -n 1 || true
-              )"
+              TUNNEL_URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)"
 
               if [ -n "$TUNNEL_URL" ]; then
                 echo "Tunnel URL: $TUNNEL_URL"
