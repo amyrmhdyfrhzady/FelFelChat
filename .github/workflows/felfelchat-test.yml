@@ -178,12 +178,31 @@ jobs:
             return 1
           }
 
+          
           verify_tunnel() {
-            curl --fail --silent --show-error \
-              --max-time 10 \
+            echo "Checking Tunnel readiness with DNS retry..."
+
+            for attempt in $(seq 1 20); do
+            if curl --fail --silent --show-error \
+             --connect-timeout 3 \
+             --max-time 5 \
               "$TUNNEL_URL/api/ready" \
-              -o /tmp/felfelchat-tunnel-ready.json
-          }
+              -o /tmp/felfelchat-tunnel-ready.json; then
+              echo "Tunnel is reachable and ready."
+              return 0
+             fi
+
+             echo "Tunnel not reachable yet ($attempt/20); retrying in 2 seconds..."
+             sleep 2
+             done
+
+             echo "::error::Tunnel remained unreachable after retries."
+             echo "Tunnel URL: $TUNNEL_URL"
+             echo "=== Tunnel log ==="
+             cat tunnel.log || true
+             return 1
+           }
+
 
           register_tunnel() {
             echo "Registering active Tunnel with Worker..."
